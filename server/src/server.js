@@ -7,89 +7,265 @@ const cors = require('cors');
 const app = express();
 const server = http.createServer(app);
 
-// Configure CORS for both Express and Socket.IO
 app.use(cors());
+app.use(express.json({ limit: '10mb' })); // Increased limit for image uploads
 
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:3000", // React dev server
+    origin: "http://localhost:3000",
     methods: ["GET", "POST"]
-  }
+  },
+  maxHttpBufferSize: 10e6 // 10MB for large images
 });
 
-// Store active users
-const users = new Map();
+// Store rooms and their data
+const rooms = new Map();
 
-// Handle WebSocket connections
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
+  
+  let currentRoom = null;
+  let currentUsername = null;
+  let currentColor = null;
 
-  // Send existing users to new user
-  socket.emit('existing-users', Array.from(users.values()));
+  // Handle room joining
+  socket.on('join-room', ({ roomId, username, color }) => {
+    currentRoom = roomId;
+    currentUsername = username;
+    currentColor = color;
 
-  // User joins
-  socket.on('user-join', (userData) => {
-    const user = {
-      id: socket.id,
-      name: userData.name || `User ${socket.id.slice(0, 4)}`,
-      color: userData.color || getRandomColor()
-    };
+    socket.join(roomId);
+    console.log(`${username} joined room: ${roomId}`);
+
+    // Initialize room if it doesn't exist
+    if (!rooms.has(roomId)) {
+      rooms.set(roomId, {
+        users: new Map(),
+        history: [],
+        state: null,
+        cursors: new Map()
+      });
+    }
+
+    const room = rooms.get(roomId);
     
-    users.set(socket.id, user);
-    
-    // Broadcast to all other users
-    socket.broadcast.emit('user-joined', user);
-    
-    // Send confirmation to this user
-    socket.emit('user-confirmed', user);
-    
-    console.log('User joined:', user);
+    // Add user to room
+    room.users.set(socket.id, { username, color, id: socket.id });
+
+    // Send current canvas state to new user
+    if (room.state) {
+      socket.emit('canvas-state', room.state);
+    }
+
+    // Broadcast updated user list to all users in room
+    const userList = Array.from(room.users.values());
+    io.to(roomId).emit('users-update', userList);
+
+    // Send existing cursors to new user
+    room.cursors.forEach((cursor, userId) => {
+      if (userId !== socket.id) {
+        socket.emit('cursor-move', cursor);
+      }
+    });
+
+    console.log(`Room ${roomId} now has ${room.users.size} users`);
   });
 
   // Handle drawing events
-  socket.on('draw', (drawData) => {
-    // Broadcast to all other users (not the sender)
-    socket.broadcast.emit('draw', {
-      ...drawData,
-      userId: socket.id
+  socket.on('draw', (data) => {
+    if (!currentRoom) return;
+
+    const room = rooms.get(currentRoom);
+    if (!room) return;
+
+    // Store drawing event in history
+    room.history.push({
+      ...data,
+      timestamp: Date.now(),
+      userId: socket.id,
+      username: currentUsername
     });
+
+    // Broadcast to all other users in the room
+    socket.to(currentRoom).emit('draw', data);
   });
 
-  // Handle undo events
-  socket.on('undo', () => {
-    socket.broadcast.emit('undo', { userId: socket.id });
+  // Handle text drawing
+  socket.on('draw-text', (data) => {
+    if (!currentRoom) return;
+
+    const room = rooms.get(currentRoom);
+    if (!room) return;
+
+    // Store text event in history
+    room.history.push({
+      type: 'text',
+      ...data,
+      timestamp: Date.now(),
+      userId: socket.id,
+      username: currentUsername
+    });
+
+    // Broadcast to all other users in the room
+    socket.to(currentRoom).emit('draw-text', data);
   });
 
-  // Handle redo events
-  socket.on('redo', () => {
-    socket.broadcast.emit('redo', { userId: socket.id });
+  // Handle image drawing
+  socket.on('draw-image', (data) => {
+    if (!currentRoom) return;
+
+    const room = rooms.get(currentRoom);
+    if (!room) return;
+
+    // Store image event in history (without full image data to save memory)
+    room.history.push({
+      type: 'image',
+      x: data.x,
+      y: data.y,
+      width: data.width,
+      height: data.height,
+      timestamp: Date.now(),
+      userId: socket.id,
+      username: currentUsername
+    });
+
+    // Broadcast to all other users in the room
+    socket.to(currentRoom).emit('draw-image', data);
+  });
+
+  // Handle cursor movement
+  socket.on('cursor-move', ({ x, y }) => {
+    if (!currentRoom) return;
+
+    const room = rooms.get(currentRoom);
+    if (!room) return;
+
+    const cursorData = {
+      userId: socket.id,
+      username: currentUsername,
+      color: currentColor,
+      x,
+      y
+    };
+
+    // Store cursor position
+    room.cursors.set(socket.id, cursorData);
+
+    // Broadcast cursor position to all other users
+    socket.to(currentRoom).emit('cursor-move', cursorData);
   });
 
   // Handle clear canvas
-  socket.on('clear', () => {
-    socket.broadcast.emit('clear', { userId: socket.id });
+  socket.on('clear-canvas', () => {
+    if (!currentRoom) return;
+
+    const room = rooms.get(currentRoom);
+    if (!room) return;
+
+    // Clear room history and state
+    room.history = [];
+    room.state = null;
+
+    // Broadcast clear to all users in room
+    io.to(currentRoom).emit('clear-canvas');
+    
+    console.log(`Canvas cleared in room: ${currentRoom}`);
   });
 
-  // Handle disconnect
-  socket.on('disconnect', () => {
-    const user = users.get(socket.id);
-    if (user) {
-      users.delete(socket.id);
-      socket.broadcast.emit('user-left', { id: socket.id });
-      console.log('User disconnected:', user.name);
+  // Handle canvas state save
+  socket.on('save-canvas', (dataURL) => {
+    if (!currentRoom) return;
+
+    const room = rooms.get(currentRoom);
+    if (!room) return;
+
+    // Save canvas state
+    room.state = dataURL;
+    console.log(`Canvas state saved for room: ${currentRoom}`);
+  });
+
+  // Handle canvas state request
+  socket.on('request-canvas-state', () => {
+    if (!currentRoom) return;
+
+    const room = rooms.get(currentRoom);
+    if (!room) return;
+
+    if (room.state) {
+      socket.emit('canvas-state', room.state);
     }
+  });
+
+  // Handle ping for latency measurement
+  socket.on('ping', (callback) => {
+    callback();
+  });
+
+  // Handle disconnection
+  socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.id);
+
+    if (currentRoom) {
+      const room = rooms.get(currentRoom);
+      if (room) {
+        // Remove user from room
+        room.users.delete(socket.id);
+        room.cursors.delete(socket.id);
+
+        // Notify other users
+        socket.to(currentRoom).emit('user-left', { userId: socket.id });
+
+        // Update user list
+        const userList = Array.from(room.users.values());
+        io.to(currentRoom).emit('users-update', userList);
+
+        console.log(`${currentUsername} left room: ${currentRoom}`);
+        console.log(`Room ${currentRoom} now has ${room.users.size} users`);
+
+        // Clean up empty rooms after 5 minutes
+        if (room.users.size === 0) {
+          setTimeout(() => {
+            const currentRoom = rooms.get(currentRoom);
+            if (currentRoom && currentRoom.users.size === 0) {
+              rooms.delete(currentRoom);
+              console.log(`Room ${currentRoom} deleted (empty)`);
+            }
+          }, 5 * 60 * 1000); // 5 minutes
+        }
+      }
+    }
+  });
+
+  // Handle errors
+  socket.on('error', (error) => {
+    console.error('Socket error:', error);
   });
 });
 
-// Helper function to generate random colors for users
-function getRandomColor() {
-  const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F', '#BB8FCE'];
-  return colors[Math.floor(Math.random() * colors.length)];
-}
-
-// Basic health check endpoint
+// Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', users: users.size });
+  res.json({ 
+    status: 'ok', 
+    rooms: rooms.size,
+    totalUsers: Array.from(rooms.values()).reduce((sum, room) => sum + room.users.size, 0)
+  });
+});
+
+// Get room info endpoint
+app.get('/room/:roomId', (req, res) => {
+  const { roomId } = req.params;
+  const room = rooms.get(roomId);
+  
+  if (!room) {
+    return res.status(404).json({ error: 'Room not found' });
+  }
+
+  res.json({
+    roomId,
+    users: Array.from(room.users.values()),
+    historyLength: room.history.length,
+    hasState: !!room.state
+  });
 });
 
 const PORT = process.env.PORT || 5000;
@@ -97,4 +273,22 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 WebSocket server ready`);
+  console.log(`🔗 Connect clients to: http://localhost:${PORT}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  server.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT signal received: closing HTTP server');
+  server.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
 });
